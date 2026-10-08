@@ -33,13 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.example.plugintemplate-for-obs"
+            "bundleId": "com.medomij.obs-camera-design"
         }
     },
-    "name": "plugintemplate-for-obs",
-    "displayName": "Plugin Template for OBS",
-    "version": "1.0.0",
-    "author": "Your Name Here",
-    "website": "https://example.com",
+    "name": "obs-camera-design",
+    "displayName": "Camera Design",
+    "version": "0.1.0",
+    "author": "medomij",
+    "website": "https://github.com/medomij/obs-camera-design",
     "email": "me@example.com"
 }

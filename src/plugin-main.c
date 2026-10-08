@@ -20,10 +20,12 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 #define T_(s) obs_module_text(s)
 
+#define S_CAMERA_ON "camera_on"
 #define S_DEVICE "video_device_id"
 #define S_RESOLUTION "resolution"
 #define S_FPS "fps"
 #define S_MIRROR "mirror"
+#define S_COMPACT "compact_box"
 #define S_ASPECT "aspect"
 #define S_CROP_L "crop_left"
 #define S_CROP_R "crop_right"
@@ -33,14 +35,18 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 #define S_OFFSET_Y "offset_y"
 #define S_ZOOM "zoom"
 #define S_CORNER "corner"
+#define S_SQUIRCLE "squircle"
 
 static const char *effect_source =
 	"uniform float4x4 ViewProj;\n"
 	"uniform texture2d image;\n"
 	"uniform float2 out_size;\n"
+	"uniform float2 win_origin;\n"
+	"uniform float2 win_size;\n"
 	"uniform float2 uv_origin;\n"
 	"uniform float2 uv_size;\n"
 	"uniform float radius;\n"
+	"uniform float shape_n;\n"
 	"uniform float mirror;\n"
 	"\n"
 	"sampler_state texSampler {\n"
@@ -64,15 +70,28 @@ static const char *effect_source =
 	"\n"
 	"float4 PSMain(VertData v_in) : TARGET\n"
 	"{\n"
-	"    float2 half_size = out_size * 0.5;\n"
-	"    float2 p = v_in.uv * out_size - half_size;\n"
-	"    float2 q = abs(p) - (half_size - float2(radius, radius));\n"
-	"    float dist = length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - radius;\n"
+	"    float2 lp = v_in.uv * out_size - win_origin;\n"
+	"    float2 half_size = win_size * 0.5;\n"
+	"    float2 p = lp - half_size;\n"
+	"    float dist = 0.0;\n"
+	"    if (radius >= 0.0) {\n"
+	"        float2 q = abs(p) - (half_size - float2(radius, radius));\n"
+	"        float2 m = max(q, float2(0.0, 0.0));\n"
+	"        float len = pow(pow(m.x, shape_n) + pow(m.y, shape_n), 1.0 / shape_n);\n"
+	"        dist = len + min(max(q.x, q.y), 0.0) - radius;\n"
+	"    } else {\n"
+	"        float r = -radius;\n"
+	"        float2 qb = abs(p) - half_size;\n"
+	"        float boxd = length(max(qb, float2(0.0, 0.0))) + min(max(qb.x, qb.y), 0.0);\n"
+	"        float2 dc = max(half_size - abs(p), float2(0.0, 0.0));\n"
+	"        float len = pow(pow(dc.x, shape_n) + pow(dc.y, shape_n), 1.0 / shape_n);\n"
+	"        dist = max(boxd, r - len);\n"
+	"    }\n"
 	"    float mask = saturate(0.5 - dist);\n"
-	"    float2 uv = v_in.uv;\n"
+	"    float2 luv = lp / win_size;\n"
 	"    if (mirror > 0.5)\n"
-	"        uv.x = 1.0 - uv.x;\n"
-	"    uv = uv_origin + uv * uv_size;\n"
+	"        luv.x = 1.0 - luv.x;\n"
+	"    float2 uv = uv_origin + luv * uv_size;\n"
 	"    float4 c = image.Sample(texSampler, uv);\n"
 	"    return float4(c.rgb, c.a * mask);\n"
 	"}\n"
@@ -95,12 +114,22 @@ struct cd_data {
 	gs_texrender_t *texrender;
 	gs_eparam_t *p_image;
 	gs_eparam_t *p_out_size;
+	gs_eparam_t *p_win_origin;
+	gs_eparam_t *p_win_size;
 	gs_eparam_t *p_uv_origin;
 	gs_eparam_t *p_uv_size;
 	gs_eparam_t *p_radius;
+	gs_eparam_t *p_shape_n;
 	gs_eparam_t *p_mirror;
 
+	bool camera_on;
+	bool showing;
+	char *device;
+	char *resolution;
+	long long fps;
+
 	bool mirror;
+	bool compact;
 	int aspect;
 	float crop_l;
 	float crop_r;
@@ -110,6 +139,7 @@ struct cd_data {
 	float offset_y;
 	float zoom;
 	float corner;
+	float squircle;
 
 	uint32_t last_w;
 	uint32_t last_h;
@@ -118,9 +148,12 @@ struct cd_data {
 struct cd_layout {
 	uint32_t out_w;
 	uint32_t out_h;
+	struct vec2 win_origin;
+	struct vec2 win_size;
 	struct vec2 uv_origin;
 	struct vec2 uv_size;
 	float radius;
+	float shape_n;
 };
 
 static float cd_clamp(float v, float lo, float hi)
@@ -170,6 +203,9 @@ static void compute_layout(const struct cd_data *d, uint32_t cw, uint32_t ch, st
 			wh = rw / target;
 	}
 
+	float wx = rx + (rw - ww) * 0.5f;
+	float wy = ry + (rh - wh) * 0.5f;
+
 	float zoom = cd_clamp(d->zoom / 100.0f, 1.0f, 8.0f);
 	float vw = ww / zoom;
 	float vh = wh / zoom;
@@ -183,15 +219,25 @@ static void compute_layout(const struct cd_data *d, uint32_t cw, uint32_t ch, st
 	l->uv_size.x = vw / fw;
 	l->uv_size.y = vh / fh;
 
-	l->out_w = (uint32_t)(ww + 0.5f);
-	l->out_h = (uint32_t)(wh + 0.5f);
-	if (l->out_w < 2)
-		l->out_w = 2;
-	if (l->out_h < 2)
-		l->out_h = 2;
+	if (d->compact) {
+		l->out_w = (uint32_t)(ww + 0.5f);
+		l->out_h = (uint32_t)(wh + 0.5f);
+		if (l->out_w < 2)
+			l->out_w = 2;
+		if (l->out_h < 2)
+			l->out_h = 2;
+		vec2_set(&l->win_origin, 0.0f, 0.0f);
+		vec2_set(&l->win_size, (float)l->out_w, (float)l->out_h);
+	} else {
+		l->out_w = cw;
+		l->out_h = ch;
+		vec2_set(&l->win_origin, wx, wy);
+		vec2_set(&l->win_size, ww, wh);
+	}
 
-	float min_side = (float)(l->out_w < l->out_h ? l->out_w : l->out_h);
-	l->radius = min_side * 0.5f * cd_clamp(d->corner, 0.0f, 100.0f) / 100.0f;
+	float min_side = fminf(l->win_size.x, l->win_size.y);
+	l->radius = min_side * 0.5f * cd_clamp(d->corner, -100.0f, 100.0f) / 100.0f;
+	l->shape_n = 2.0f + cd_clamp(d->squircle, 0.0f, 100.0f) / 100.0f * 6.0f;
 }
 
 static void get_child_size(struct cd_data *d, uint32_t *w, uint32_t *h)
@@ -206,6 +252,62 @@ static void get_child_size(struct cd_data *d, uint32_t *w, uint32_t *h)
 	*h = d->last_h;
 }
 
+static obs_data_t *build_child_settings(const struct cd_data *d)
+{
+	obs_data_t *cs = obs_data_create();
+
+	if (d->device && *d->device)
+		obs_data_set_string(cs, "video_device_id", d->device);
+
+	if (d->resolution && *d->resolution && strcmp(d->resolution, "auto") != 0) {
+		obs_data_set_int(cs, "res_type", 1);
+		obs_data_set_string(cs, "resolution", d->resolution);
+	} else {
+		obs_data_set_int(cs, "res_type", 0);
+	}
+
+	if (d->fps > 0)
+		obs_data_set_int(cs, "frame_interval", 10000000LL / d->fps);
+	else
+		obs_data_set_int(cs, "frame_interval", 0);
+
+	return cs;
+}
+
+static void camera_start(struct cd_data *d)
+{
+	obs_data_t *cs = build_child_settings(d);
+	obs_source_t *child = obs_source_create_private("dshow_input", "camera_design_camera", cs);
+	obs_data_release(cs);
+
+	if (!child) {
+		obs_log(LOG_WARNING, "camera source (dshow_input) is not available on this system");
+		return;
+	}
+	if (d->showing)
+		obs_source_inc_showing(child);
+
+	obs_enter_graphics();
+	d->child = child;
+	obs_leave_graphics();
+}
+
+static void camera_stop(struct cd_data *d)
+{
+	obs_source_t *old;
+
+	obs_enter_graphics();
+	old = d->child;
+	d->child = NULL;
+	obs_leave_graphics();
+
+	if (old) {
+		if (d->showing)
+			obs_source_dec_showing(old);
+		obs_source_release(old);
+	}
+}
+
 static const char *cd_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -217,6 +319,7 @@ static void cd_update(void *data, obs_data_t *settings)
 	struct cd_data *d = data;
 
 	d->mirror = obs_data_get_bool(settings, S_MIRROR);
+	d->compact = obs_data_get_bool(settings, S_COMPACT);
 	d->aspect = (int)obs_data_get_int(settings, S_ASPECT);
 	d->crop_l = (float)obs_data_get_double(settings, S_CROP_L);
 	d->crop_r = (float)obs_data_get_double(settings, S_CROP_R);
@@ -226,31 +329,41 @@ static void cd_update(void *data, obs_data_t *settings)
 	d->offset_y = (float)obs_data_get_double(settings, S_OFFSET_Y);
 	d->zoom = (float)obs_data_get_double(settings, S_ZOOM);
 	d->corner = (float)obs_data_get_double(settings, S_CORNER);
+	d->squircle = (float)obs_data_get_double(settings, S_SQUIRCLE);
 
-	if (!d->child)
-		return;
-
-	obs_data_t *cs = obs_data_create();
 	const char *dev = obs_data_get_string(settings, S_DEVICE);
-	if (dev && *dev)
-		obs_data_set_string(cs, "video_device_id", dev);
-
 	const char *res = obs_data_get_string(settings, S_RESOLUTION);
-	if (res && *res && strcmp(res, "auto") != 0) {
-		obs_data_set_int(cs, "res_type", 1);
-		obs_data_set_string(cs, "resolution", res);
-	} else {
-		obs_data_set_int(cs, "res_type", 0);
+	long long fps = obs_data_get_int(settings, S_FPS);
+	bool on = obs_data_get_bool(settings, S_CAMERA_ON);
+
+	bool changed = !d->device || !d->resolution;
+	if (!changed)
+		changed = strcmp(d->device, dev) != 0 || strcmp(d->resolution, res) != 0 || d->fps != fps;
+	if (changed) {
+		bfree(d->device);
+		bfree(d->resolution);
+		d->device = bstrdup(dev);
+		d->resolution = bstrdup(res);
+		d->fps = fps;
 	}
 
-	long long fps = obs_data_get_int(settings, S_FPS);
-	if (fps > 0)
-		obs_data_set_int(cs, "frame_interval", 10000000LL / fps);
-	else
-		obs_data_set_int(cs, "frame_interval", 0);
+	d->camera_on = on;
+	if (!on) {
+		if (d->child)
+			camera_stop(d);
+		return;
+	}
 
-	obs_source_update(d->child, cs);
-	obs_data_release(cs);
+	if (!d->child) {
+		camera_start(d);
+		return;
+	}
+
+	if (changed) {
+		obs_data_t *cs = build_child_settings(d);
+		obs_source_update(d->child, cs);
+		obs_data_release(cs);
+	}
 }
 
 static void *cd_create(obs_data_t *settings, obs_source_t *source)
@@ -270,16 +383,15 @@ static void *cd_create(obs_data_t *settings, obs_source_t *source)
 	if (d->effect) {
 		d->p_image = gs_effect_get_param_by_name(d->effect, "image");
 		d->p_out_size = gs_effect_get_param_by_name(d->effect, "out_size");
+		d->p_win_origin = gs_effect_get_param_by_name(d->effect, "win_origin");
+		d->p_win_size = gs_effect_get_param_by_name(d->effect, "win_size");
 		d->p_uv_origin = gs_effect_get_param_by_name(d->effect, "uv_origin");
 		d->p_uv_size = gs_effect_get_param_by_name(d->effect, "uv_size");
 		d->p_radius = gs_effect_get_param_by_name(d->effect, "radius");
+		d->p_shape_n = gs_effect_get_param_by_name(d->effect, "shape_n");
 		d->p_mirror = gs_effect_get_param_by_name(d->effect, "mirror");
 	}
 	obs_leave_graphics();
-
-	d->child = obs_source_create_private("dshow_input", "camera_design_camera", NULL);
-	if (!d->child)
-		obs_log(LOG_WARNING, "camera source (dshow_input) is not available on this system");
 
 	cd_update(d, settings);
 	return d;
@@ -289,20 +401,24 @@ static void cd_destroy(void *data)
 {
 	struct cd_data *d = data;
 
-	if (d->child)
-		obs_source_release(d->child);
+	camera_stop(d);
 
 	obs_enter_graphics();
 	gs_texrender_destroy(d->texrender);
 	gs_effect_destroy(d->effect);
 	obs_leave_graphics();
 
+	bfree(d->device);
+	bfree(d->resolution);
 	bfree(d);
 }
 
 static void cd_show(void *data)
 {
 	struct cd_data *d = data;
+	if (d->showing)
+		return;
+	d->showing = true;
 	if (d->child)
 		obs_source_inc_showing(d->child);
 }
@@ -310,15 +426,20 @@ static void cd_show(void *data)
 static void cd_hide(void *data)
 {
 	struct cd_data *d = data;
+	if (!d->showing)
+		return;
+	d->showing = false;
 	if (d->child)
 		obs_source_dec_showing(d->child);
 }
 
 static void cd_get_defaults(obs_data_t *settings)
 {
+	obs_data_set_default_bool(settings, S_CAMERA_ON, true);
 	obs_data_set_default_string(settings, S_RESOLUTION, "auto");
 	obs_data_set_default_int(settings, S_FPS, 0);
 	obs_data_set_default_bool(settings, S_MIRROR, false);
+	obs_data_set_default_bool(settings, S_COMPACT, false);
 	obs_data_set_default_int(settings, S_ASPECT, 0);
 	obs_data_set_default_double(settings, S_CROP_L, 0.0);
 	obs_data_set_default_double(settings, S_CROP_R, 0.0);
@@ -328,14 +449,22 @@ static void cd_get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, S_OFFSET_Y, 0.0);
 	obs_data_set_default_double(settings, S_ZOOM, 100.0);
 	obs_data_set_default_double(settings, S_CORNER, 12.0);
+	obs_data_set_default_double(settings, S_SQUIRCLE, 0.0);
 }
 
 static void add_device_items(struct cd_data *d, obs_property_t *list)
 {
-	if (!d->child)
+	obs_source_t *tmp = NULL;
+	obs_source_t *src = d->child;
+
+	if (!src) {
+		tmp = obs_source_create_private("dshow_input", "camera_design_probe", NULL);
+		src = tmp;
+	}
+	if (!src)
 		return;
 
-	obs_properties_t *cp = obs_source_properties(d->child);
+	obs_properties_t *cp = obs_source_properties(src);
 	obs_property_t *dev = cp ? obs_properties_get(cp, "video_device_id") : NULL;
 	if (dev) {
 		size_t n = obs_property_list_item_count(dev);
@@ -347,6 +476,22 @@ static void add_device_items(struct cd_data *d, obs_property_t *list)
 		}
 	}
 	obs_properties_destroy(cp);
+
+	if (tmp)
+		obs_source_release(tmp);
+}
+
+static bool toggle_camera_clicked(obs_properties_t *props, obs_property_t *prop, void *data)
+{
+	struct cd_data *d = data;
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(prop);
+
+	obs_data_t *s = obs_source_get_settings(d->source);
+	obs_data_set_bool(s, S_CAMERA_ON, !d->camera_on);
+	obs_source_update(d->source, s);
+	obs_data_release(s);
+	return true;
 }
 
 static void add_slider(obs_properties_t *g, const char *key, const char *label, double min, double max)
@@ -363,6 +508,8 @@ static obs_properties_t *cd_get_properties(void *data)
 	obs_property_t *p;
 
 	g = obs_properties_create();
+	const char *toggle_label = d->camera_on ? T_("CameraOff") : T_("CameraOn");
+	obs_properties_add_button(g, "toggle_camera", toggle_label, toggle_camera_clicked);
 	p = obs_properties_add_list(g, S_DEVICE, T_("Device"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	add_device_items(d, p);
 	p = obs_properties_add_list(g, S_RESOLUTION, T_("Resolution"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -380,6 +527,7 @@ static obs_properties_t *cd_get_properties(void *data)
 
 	g = obs_properties_create();
 	obs_properties_add_bool(g, S_MIRROR, T_("Mirror"));
+	obs_properties_add_bool(g, S_COMPACT, T_("Compact"));
 	p = obs_properties_add_list(g, S_ASPECT, T_("Aspect"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, T_("AspectOriginal"), 0);
 	obs_property_list_add_int(p, "16:9", 1);
@@ -397,7 +545,8 @@ static obs_properties_t *cd_get_properties(void *data)
 	obs_properties_add_group(props, "group_frame", T_("GroupFrame"), OBS_GROUP_NORMAL, g);
 
 	g = obs_properties_create();
-	add_slider(g, S_CORNER, "Corner", 0.0, 100.0);
+	add_slider(g, S_CORNER, "Corner", -100.0, 100.0);
+	add_slider(g, S_SQUIRCLE, "Squircle", 0.0, 100.0);
 	obs_properties_add_group(props, "group_corners", T_("GroupCorners"), OBS_GROUP_NORMAL, g);
 
 	return props;
@@ -460,9 +609,12 @@ static void cd_video_render(void *data, gs_effect_t *unused)
 
 	gs_effect_set_texture(d->p_image, tex);
 	gs_effect_set_vec2(d->p_out_size, &out_size);
+	gs_effect_set_vec2(d->p_win_origin, &l.win_origin);
+	gs_effect_set_vec2(d->p_win_size, &l.win_size);
 	gs_effect_set_vec2(d->p_uv_origin, &l.uv_origin);
 	gs_effect_set_vec2(d->p_uv_size, &l.uv_size);
 	gs_effect_set_float(d->p_radius, l.radius);
+	gs_effect_set_float(d->p_shape_n, l.shape_n);
 	gs_effect_set_float(d->p_mirror, d->mirror ? 1.0f : 0.0f);
 
 	while (gs_effect_loop(d->effect, "Draw"))

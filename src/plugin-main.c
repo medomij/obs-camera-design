@@ -12,6 +12,7 @@ the Free Software Foundation; either version 2 of the License, or
 #include <graphics/vec4.h>
 #include <math.h>
 #include <obs-module.h>
+#include <obs-frontend-api.h>
 #include <plugin-support.h>
 #include <string.h>
 
@@ -494,6 +495,17 @@ static bool toggle_camera_clicked(obs_properties_t *props, obs_property_t *prop,
 	return true;
 }
 
+static bool open_camera_settings_clicked(obs_properties_t *props, obs_property_t *prop, void *data)
+{
+	struct cd_data *d = data;
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(prop);
+
+	if (d->child)
+		obs_frontend_open_source_properties(d->child);
+	return true;
+}
+
 static void add_slider(obs_properties_t *g, const char *key, const char *label, double min, double max)
 {
 	obs_property_t *p = obs_properties_add_float_slider(g, key, T_(label), min, max, 0.1);
@@ -510,6 +522,8 @@ static obs_properties_t *cd_get_properties(void *data)
 	g = obs_properties_create();
 	const char *toggle_label = d->camera_on ? T_("CameraOff") : T_("CameraOn");
 	obs_properties_add_button(g, "toggle_camera", toggle_label, toggle_camera_clicked);
+	p = obs_properties_add_button(g, "camera_settings", T_("CameraSettings"), open_camera_settings_clicked);
+	obs_property_set_enabled(p, d->child != NULL);
 	p = obs_properties_add_list(g, S_DEVICE, T_("Device"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	add_device_items(d, p);
 	p = obs_properties_add_list(g, S_RESOLUTION, T_("Resolution"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
